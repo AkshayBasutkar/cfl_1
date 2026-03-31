@@ -1,3 +1,54 @@
+"""
+CFL Phase 2 – Production Apex Pipeline (Parallel Meta-Ensemble)
+================================================================
+Dynamically runs Model 1, Model 2, and Model 3 in parallel threads and fuses
+their FY26 Q2 unit-booking forecasts into a single, risk-managed submission.
+
+Pipeline summary
+----------------
+1. **Model 1 – Hybrid Risk-Managed Anchor**
+   Trains LightGBM (custom asymmetric loss) and XGBoost on log-transformed lag
+   features, applies lifecycle multipliers, then blends the ML forecast with
+   human Demand-Planning (DP) and Data-Science (DS) forecasts using dynamic
+   accuracy-weighted coefficients.
+
+2. **Model 2 – v1 Human-Ensemble Architecture**
+   Averages available DP / Marketing / DS human forecasts and mixes that
+   average with a 3-period moving average of historical actuals
+   (global alpha ≈ 0.84 / 0.16).
+
+3. **Model 3 – v8 Oracle Engine**
+   Applies hardcoded business-logic overrides for known high-value products and
+   uses a simple momentum rule (±5 %) for all others.
+
+4. **Bifurcated Meta-Fusion**
+   - Cost Rank ≤ 3  →  50 % Model 1 + 50 % Model 2
+   - Cost Rank >  3  →  min(Model 1, Model 2, Model 3)
+
+Input
+-----
+FILE_PATH : str
+    Path to the Excel workbook ``CFL_External Data Pack_Phase2.xlsx``.
+    Required sheet: ``Ph.2 Data Pack-Actual Booking``.
+
+Output
+------
+A CSV file at ``/content/CFL_Phase2_Final_Pipeline_Submission.csv`` containing
+columns ``Cost Rank``, ``Product Name``, and ``Predicted FY26 Q2 Units``,
+sorted by Cost Rank ascending.
+
+A per-product diagnostic table is also printed to stdout showing FY26 Q1
+back-test accuracy for indicative model evaluation.
+
+Usage
+-----
+    python main.py
+
+Dependencies
+------------
+pandas, numpy, scikit-learn, xgboost, lightgbm, openpyxl
+"""
+
 #pipelined 3 models
 # ==============================================================================
 # 🏆 THE PRODUCTION APEX PIPELINE (PARALLEL META-ENSEMBLE)
@@ -23,7 +74,39 @@ FILE_PATH = '/content/CFL_External Data Pack_Phase2.xlsx'
 # 1. MODEL 1: HYBRID RISK-MANAGED ARCHITECTURE (Isolated Execution)
 # ==============================================================================
 def execute_model_1(filepath):
-    print("⏳ [Thread 1] Starting Model 1 (Risk-Managed Anchor)...")
+    """Run Model 1: Hybrid Risk-Managed Anchor.
+
+    Loads the booking data, engineers lag and rolling-mean features, trains a
+    LightGBM + XGBoost ensemble on log-transformed targets, applies lifecycle
+    multipliers, and finally blends the ML forecast with human DP / DS inputs
+    using dynamic accuracy-weighted coefficients derived from historical bias.
+
+    Parameters
+    ----------
+    filepath : str
+        Absolute path to the input Excel workbook
+        (``CFL_External Data Pack_Phase2.xlsx``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with columns ``['Cost Rank', 'Product', 'M1_Pred']``
+        containing one row per product.  ``M1_Pred`` is a non-negative integer.
+
+    Notes
+    -----
+    Feature set used for ML training:
+        ``Log_Lag_1`` … ``Log_Lag_5``, ``Log_Roll_Mean``, ``YoY_Growth``
+
+    Lifecycle multipliers applied to the raw ML base forecast:
+        * Decline → × 0.85
+        * NPI     → × 1.15
+
+    Dynamic blend weights (before normalisation):
+        * ``w_DS  = min((1 − DS_error) × 0.45, 0.50)``
+        * ``w_DP  = min((1 − DP_error) × 0.35, 0.50)``
+        * ``w_ML  = max(1 − (w_DS + w_DP), 0.20)``
+    """
     xl = pd.ExcelFile(filepath)
     df_raw = xl.parse('Ph.2 Data Pack-Actual Booking', header=None)
     QUARTERS = ['FY23 Q2', 'FY23 Q3', 'FY23 Q4', 'FY24 Q1', 'FY24 Q2', 'FY24 Q3',
@@ -77,7 +160,28 @@ def execute_model_1(filepath):
     X_test = test_df[features]
 
     def custom_asymmetric_objective(y_true, y_pred):
-        residual = y_true - y_pred
+        """Custom asymmetric LightGBM objective that penalizes over-predictions.
+
+        The residual is defined as ``residual = y_true - y_pred``.
+        Over-forecasting (``y_pred > y_true``, so ``residual < 0``) is
+        penalized with a gradient coefficient of 2.4, while under-forecasting
+        uses 2.0.  This biases the model towards conservative estimates,
+        reducing excess-inventory risk.
+
+        Parameters
+        ----------
+        y_true : numpy.ndarray
+            True log-transformed target values.
+        y_pred : numpy.ndarray
+            Predicted log-transformed values from the current tree iteration.
+
+        Returns
+        -------
+        grad : numpy.ndarray
+            First-order gradient of the loss.
+        hess : numpy.ndarray
+            Second-order (constant) Hessian of the loss.
+        """
         grad = np.where(residual < 0, -2.4 * residual, -2.0 * residual)
         hess = np.where(residual < 0, 2.4, 2.0)
         return grad, hess
@@ -96,7 +200,23 @@ def execute_model_1(filepath):
     final_df = pd.merge(test_df[['Product', 'Cost Rank', 'ML_Adjusted']], team_f, on='Product', how='left')
 
     def production_dynamic_blend(row):
-        prod = row['Product']
+        """Compute the accuracy-weighted blend of ML, DS, and DP forecasts.
+
+        Weights are derived from each forecaster's historical bias: lower
+        historical error → higher weight.  The ML floor is guaranteed at 20 %
+        of the total weight, capping DS at 50 % and DP at 50 %.
+
+        Parameters
+        ----------
+        row : pandas.Series
+            A single row from ``final_df`` containing at least the fields
+            ``Product``, ``ML_Adjusted``, ``DS_Q2``, and ``DP_Q2``.
+
+        Returns
+        -------
+        float
+            Blended forecast value (un-clipped, un-rounded).
+        """
         ml_f, ds_f, dp_f = row['ML_Adjusted'], row['DS_Q2'], row['DP_Q2']
         ds_err = abs(acc_map.get(prod, {}).get('DS_Bias_Past', 0.12))
         dp_err = abs(acc_map.get(prod, {}).get('DP_Bias_Past', 0.15))
@@ -116,7 +236,34 @@ def execute_model_1(filepath):
 # 2. MODEL 2: v1 ARCHITECTURE (Isolated Execution)
 # ==============================================================================
 def execute_model_2(filepath):
-    print("⏳ [Thread 2] Starting Model 2 (v1 Architecture)...")
+    """Run Model 2: v1 Human-Ensemble Architecture.
+
+    For each product, averages the available human forecasts (Demand Planning,
+    Marketing, Data Science) and blends that average with a 3-period trailing
+    moving average of historical actuals using a fixed global alpha (0.84 / 0.16).
+
+    Parameters
+    ----------
+    filepath : str
+        Absolute path to the input Excel workbook
+        (``CFL_External Data Pack_Phase2.xlsx``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with columns ``['Product', 'M2_Pred']`` containing one row
+        per product.  ``M2_Pred`` is a non-negative integer.
+
+    Notes
+    -----
+    Blend formula::
+
+        M2_Pred = mean(available human forecasts) × 0.84
+                + 3-period moving average          × 0.16
+
+    If no human forecasts are available for a product, the 3-period moving
+    average is used as the sole predictor (fallback).
+    """
     # For speed and brevity in the parallel pipeline, we use a streamlined
     # proxy of Model 2's output logic utilizing the DP/DS/Mkt blend architecture.
     # (In a true modular environment, this would call import model2; model2.predict())
@@ -154,7 +301,37 @@ def execute_model_2(filepath):
 # 3. MODEL 3: v8 ORACLE ENGINE (Isolated Execution)
 # ==============================================================================
 def execute_model_3(filepath):
-    print("⏳ [Thread 3] Starting Model 3 (v8 Oracle Engine)...")
+    """Run Model 3: v8 Oracle Engine.
+
+    Applies hardcoded business-logic overrides for specific high-value products
+    and uses a simple momentum rule for all other products:
+    if the most recent quarter's actuals exceed the prior quarter's actuals the
+    forecast is a 5 % uplift, otherwise a 5 % haircut is applied.
+
+    Parameters
+    ----------
+    filepath : str
+        Absolute path to the input Excel workbook
+        (``CFL_External Data Pack_Phase2.xlsx``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with columns ``['Product', 'M3_Pred']`` containing one row
+        per product.  ``M3_Pred`` is a non-negative integer.
+
+    Notes
+    -----
+    Business-logic overrides (hardcoded)::
+
+        'IP PHONE Enterprise Desk_1'  →  10,500
+        'IP PHONE Enterprise Desk_2'  →   5,800
+
+    Momentum rule for all other products::
+
+        M3_Pred = lag_1 × 1.05   if lag_1 > lag_2   (upward trend)
+                = lag_1 × 0.95   otherwise            (flat / declining trend)
+    """
     xl = pd.ExcelFile(filepath)
     df_raw = xl.parse('Ph.2 Data Pack-Actual Booking', header=None)
 
@@ -187,7 +364,39 @@ def execute_model_3(filepath):
 # 4. PARALLEL EXECUTION & BIFURCATED META-FUSION
 # ==============================================================================
 def run_parallel_pipeline():
-    print("\n" + "="*80)
+    """Orchestrate the full parallel multi-model inference pipeline.
+
+    Executes the three model functions concurrently in a ``ThreadPoolExecutor``
+    (3 workers), merges their outputs, applies the bifurcated meta-fusion
+    strategy to produce a single ``FINAL_META_FORECAST`` per product, saves
+    the submission CSV, and prints a per-product accuracy diagnostic table
+    using FY26 Q1 actuals as a back-test reference.
+
+    Meta-fusion routing by Cost Rank
+    ---------------------------------
+    * **Cost Rank ≤ 3** (high-priority products):
+      ``0.50 × M1_Pred + 0.50 × M2_Pred``
+    * **Cost Rank > 3** (standard products):
+      ``min(M1_Pred, M2_Pred, M3_Pred)``
+
+    Outputs
+    -------
+    * **CSV file** at ``/content/CFL_Phase2_Final_Pipeline_Submission.csv``
+      with columns ``Cost Rank``, ``Product Name``, ``Predicted FY26 Q2 Units``
+      sorted by Cost Rank ascending.
+    * **Diagnostic table** printed to stdout showing per-product Actual,
+      Forecast, Accuracy (%), and qualitative status for the FY26 Q1 back-test.
+
+    Accuracy status thresholds::
+
+        ≥ 90 %          →  ✓ Excellent
+        75 % – 89 %     →  △ Acceptable
+        < 75 %          →  ⚠ Critical Miss
+
+    Returns
+    -------
+    None
+    """
     print("⚡ LAUNCHING PARALLEL MULTI-MODEL INFERENCE PIPELINE")
     print("="*80)
 
@@ -209,7 +418,27 @@ def run_parallel_pipeline():
 
     # ===================== META FUSION =====================
     def optimized_meta_fusion(row):
-        cr = row['Cost Rank']
+        """Apply bifurcated meta-fusion to produce the final forecast.
+
+        Routes each product through one of two fusion strategies based on its
+        Cost Rank:
+
+        * **Cost Rank ≤ 3** (high-priority): equal-weight average of M1 and M2,
+          providing a stable, high-confidence estimate for flagship products.
+        * **Cost Rank > 3** (standard): minimum across all three models,
+          acting as a conservative floor that guards against over-stocking.
+
+        Parameters
+        ----------
+        row : pandas.Series
+            A single row from ``meta_df`` containing ``Cost Rank``,
+            ``M1_Pred``, ``M2_Pred``, and ``M3_Pred``.
+
+        Returns
+        -------
+        float
+            Final fused forecast value (un-rounded).
+        """
         m1, m2, m3 = row['M1_Pred'], row['M2_Pred'], row['M3_Pred']
 
         if cr <= 3:
